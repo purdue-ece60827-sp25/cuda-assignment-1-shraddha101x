@@ -60,7 +60,7 @@ int runGpuSaxpy(int vectorSize) {
 	#endif
 	
 	//Part 1: Allocate device memory for a, b and c
-	//Copy a and b to device memory
+	//Copy a and c to device memory
 	cudaMalloc((void **) &a_d, size);
 	cudaMalloc((void **) &c_d, size);
 	
@@ -89,6 +89,7 @@ int runGpuSaxpy(int vectorSize) {
 	int errorCount = verifyVector(a_h, b_h, c_h, scale, vectorSize);
 	std::cout << "Found " << errorCount << " / " << vectorSize << " errors \n";
 	
+	//Free Memory 
 	free(a_h);
 	free(b_h);
 	free(c_h);
@@ -119,7 +120,7 @@ void generatePoints (uint64_t * pSums, uint64_t pSumSize, uint64_t sampleSize) {
 	if (idx < pSumSize){
 		// Setup state  
 		curandState_t state;
-		curand_init(12345ULL, idx, 0, &state);
+		curand_init(clock64(), idx, 0, &state);
 
         uint64_t localHits = 0;
         
@@ -144,19 +145,28 @@ __global__
 void reduceCounts (uint64_t * pSums, uint64_t * totals, uint64_t pSumSize, uint64_t reduceSize) {
 	//	Insert code here
 	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	uint64_t reduceThreadCount = pSumSize / reduceSize;
 	
-	if (idx < reduceSize){
-		uint64_t sum = 0;
-		uint64_t start = idx * int(pSumSize/reduceSize);
-		uint64_t end = start + int(pSumSize/reduceSize);
-		
-		for (uint64_t i = start; i < end; i++) { 
-			sum += pSums[i]; 
-		}
-			
-		totals[idx] = sum;
-		
+	if (pSumSize % reduceSize != 0){
+		reduceThreadCount ++;
 	}
+
+	if (idx >= reduceThreadCount){
+		return;
+	}
+	
+	uint64_t start = idx*reduceSize;
+	uint64_t end = idx*reduceSize + reduceSize;
+	uint64_t sum = 0;
+	
+	if (idx == reduceThreadCount - 1){
+		end = min(idx*reduceSize + reduceSize, pSumSize);		
+	}
+		
+	for (uint64_t i = start; i < end; i++) { 
+			sum += pSums[i]; 
+		}		
+		totals[idx] = sum;
 }
 
 int runGpuMCPi (uint64_t generateThreadCount, uint64_t sampleSize, 
@@ -185,60 +195,59 @@ int runGpuMCPi (uint64_t generateThreadCount, uint64_t sampleSize,
 	return 0;
 }
 
-double estimatePi(uint64_t generateThreadCount, uint64_t sampleSize, 
-	uint64_t reduceThreadCount, uint64_t reduceSize) {
+double estimatePi(uint64_t generateThreadCount, uint64_t sampleSize,
+ uint64_t reduceThreadCount, uint64_t reduceSize) {
+	 float approxPi = 0;
+	 
+     //  Insert code here
+     
+     if(generateThreadCount%reduceSize != 0) {
+		 reduceThreadCount++;
+     }
+     
+	 int sizeK1 = generateThreadCount*sizeof(uint64_t);
+	 int sizeK2 = reduceThreadCount*sizeof(uint64_t);
 	
-	float approxPi = 0;
+	 //Part 1: Allocate Memory on the device
+	 uint64_t *pSums_d;
+	 cudaMalloc((void **) &pSums_d, sizeK1);
+     uint64_t *totals_d;
+	 cudaMalloc((void **) &totals_d, sizeK2);
+	 
+	 //Part 2: Call Kernel - to launch a grid of threads
+	 generatePoints <<< ceil(generateThreadCount/256.0), 256>>> (pSums_d, generateThreadCount, sampleSize);
+     cudaDeviceSynchronize();
+ 	 
+	 reduceCounts <<< ceil(reduceThreadCount/256.0), 256>>> (pSums_d, totals_d, generateThreadCount, reduceSize);
+     cudaDeviceSynchronize();
 
-	//      Insert code here
-	int sizeK1 = generateThreadCount*sizeof(uint64_t);
-	int sizeK2 = reduceThreadCount*sizeof(uint64_t);
-	
-	//Part 1: Allocate Memory on the device
-	uint64_t *pSums_d;
-	cudaMalloc((void **) &pSums_d, sizeK1);
-	
-	uint64_t *totals_d;
-    cudaMalloc((void **) &totals_d, sizeK2);
-	
-	//Part 2: Call Kernel - to launch a grid of threads
-	generatePoints <<< ceil(generateThreadCount/256.0), 256>>> (pSums_d, generateThreadCount, sampleSize);
-	cudaDeviceSynchronize();
-	
-	reduceCounts <<< ceil(reduceThreadCount/256.0), 256>>> (pSums_d, totals_d, generateThreadCount, reduceThreadCount);
-	cudaDeviceSynchronize();
-	
-	//Part 3: Copy C from the device memory
-	uint64_t * totals_h;
-	totals_h = (uint64_t *) malloc(sizeK2);
+	 //Part 3: Copy C from the device memory
+	 uint64_t * totals_h;
+	 totals_h = (uint64_t *) malloc(sizeK2);
 
-
-	if (totals_h == NULL) {
-		std::cout << "Unable to malloc memory ... Exiting!";
-		return -1;
-	}
-	
-	cudaMemcpy(totals_h, totals_d, sizeK2, cudaMemcpyDeviceToHost);
-	
-	// Final reduction on the host
-	
-	uint64_t totalHits = 0;     
-	
-	for (uint64_t i = 0; i < reduceThreadCount; i++) {         
-		totalHits += totals_h[i];
-	}     
-	
-	// Free device and host memory
-	cudaFree(pSums_d); 
-	cudaFree(totals_d);     
-	
-	// Calculate pi
-	uint64_t totalPoints = generateThreadCount * sampleSize;     
-	approxPi = 4.0f * (double)totalHits / totalPoints; 
-	
-	free(totals_h);
-	
-	//std::cout << "Sneaky, you are ...\n";
-	//std::cout << "Compute pi, you must!\n";
-	return approxPi;
+	 if (totals_h == NULL) {
+		 std::cout << "Unable to malloc memory ... Exiting!";
+		 return -1;
+	 }
+ 
+     cudaMemcpy(totals_h, totals_d, sizeK2, cudaMemcpyDeviceToHost);
+ 
+	 // Final reduction on the host
+	 uint64_t totalHits = 0;    
+	 for (uint64_t i = 0; i < reduceThreadCount; i++) {        
+		 totalHits += totals_h[i];
+	 }    
+	 
+	 // Free device and host memory
+	 cudaFree(pSums_d);
+	 cudaFree(totals_d); 
+	 free(totals_h);  
+	  
+	 // Calculate pi
+	 uint64_t totalPoints = generateThreadCount * sampleSize;    
+	 approxPi = 4.0f * (double)totalHits / totalPoints;
+	 	 
+	 //std::cout << "Sneaky, you are ...\n";
+	 //std::cout << "Compute pi, you must!\n";
+	 return approxPi;
 }
